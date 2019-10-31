@@ -1,3 +1,7 @@
+0.208
+
+- Allow setting config values from environment variables.
+
 0.184
 
 - Match enums case-insensitively in configuration.

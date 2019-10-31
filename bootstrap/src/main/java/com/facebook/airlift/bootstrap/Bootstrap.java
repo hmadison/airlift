@@ -26,6 +26,7 @@ import com.facebook.airlift.log.Logger;
 import com.facebook.airlift.log.Logging;
 import com.facebook.airlift.log.LoggingConfiguration;
 import com.google.common.annotations.Beta;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableList.Builder;
@@ -40,12 +41,15 @@ import com.google.inject.spi.Message;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
-import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.function.BiConsumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.facebook.airlift.configuration.ConfigurationLoader.getSystemProperties;
 import static com.facebook.airlift.configuration.ConfigurationLoader.loadPropertiesFrom;
@@ -64,6 +68,8 @@ import static java.lang.Boolean.parseBoolean;
  */
 public class Bootstrap
 {
+    private static final Pattern ENV_PATTERN = Pattern.compile("\\$\\{ENV:([a-zA-Z][a-zA-Z0-9_]*)}");
+
     private final Logger log = Logger.get("Bootstrap");
     private final List<Module> modules;
 
@@ -169,6 +175,8 @@ public class Bootstrap
 
         Thread.currentThread().setUncaughtExceptionHandler((thread, throwable) -> log.error(throwable, "Uncaught exception in thread %s", thread.getName()));
 
+        List<Message> messages = new ArrayList<>();
+
         Map<String, String> requiredProperties;
         ConfigurationFactory configurationFactory;
         if (requiredConfigurationProperties == null) {
@@ -189,18 +197,29 @@ public class Bootstrap
         else {
             requiredProperties = requiredConfigurationProperties;
         }
-        SortedMap<String, String> properties = new TreeMap<>();
+        Map<String, String> unusedProperties = new TreeMap<>(requiredProperties);
+
+        // combine property sources
+        Map<String, String> properties = new HashMap<>();
         if (optionalConfigurationProperties != null) {
             properties.putAll(optionalConfigurationProperties);
         }
         properties.putAll(requiredProperties);
         properties.putAll(getSystemProperties());
+
+        // replace environment variables in property values
+        properties = replaceEnvironmentVariables(properties, System.getenv(), (key, error) -> {
+            unusedProperties.remove(key);
+            messages.add(new Message(error));
+        });
+
+        // create configuration factory
         properties = ImmutableSortedMap.copyOf(properties);
 
         configurationFactory = new ConfigurationFactory(properties, log::warn);
 
+        // initialize logging
         if (logging != null) {
-            // initialize logging
             log.info("Initializing logging");
             LoggingConfiguration configuration = configurationFactory.build(LoggingConfiguration.class);
             logging.configure(configuration);
@@ -210,12 +229,15 @@ public class Bootstrap
         configurationFactory.registerConfigurationClasses(modules);
 
         // Validate configuration classes
-        List<Message> messages = configurationFactory.validateRegisteredConfigurationProvider();
+        messages.addAll(configurationFactory.validateRegisteredConfigurationProvider());
 
         // at this point all config file properties should be used
         // so we can calculate the unused properties
-        Map<String, String> unusedProperties = new TreeMap<>(requiredProperties);
         unusedProperties.keySet().removeAll(configurationFactory.getUsedProperties());
+
+        for (String key : unusedProperties.keySet()) {
+            messages.add(new Message(format("Configuration property '%s' was not used", key)));
+        }
 
         // Log effective configuration
         if (!quiet) {
@@ -237,14 +259,6 @@ public class Bootstrap
             moduleList.add(Binder::requireExplicitBindings);
         }
 
-        // todo this should be part of the ValidationErrorModule
-        if (strictConfig) {
-            moduleList.add(binder -> {
-                for (Entry<String, String> unusedProperty : unusedProperties.entrySet()) {
-                    binder.addError("Configuration property '%s' was not used", unusedProperty.getKey());
-                }
-            });
-        }
         moduleList.addAll(modules);
 
         // create the injector
@@ -298,12 +312,27 @@ public class Bootstrap
         return columnPrinter;
     }
 
-    private boolean getDefaultFromProperties(String propertyName, boolean defaultValue)
+    @VisibleForTesting
+    static Map<String, String> replaceEnvironmentVariables(
+            Map<String, String> properties,
+            Map<String, String> environment,
+            BiConsumer<String, String> onError)
     {
-        String propertyValue = System.getProperty(propertyName);
-        if (propertyValue != null) {
-            return parseBoolean(propertyValue);
-        }
-        return defaultValue;
+        Map<String, String> replaced = new HashMap<>();
+        properties.forEach((propertyKey, propertyValue) -> {
+            Matcher matcher = ENV_PATTERN.matcher(propertyValue);
+            if (!matcher.matches()) {
+                replaced.put(propertyKey, propertyValue);
+                return;
+            }
+            String envName = matcher.group(1);
+            String envValue = environment.get(envName);
+            if (envValue == null) {
+                onError.accept(propertyKey, format("Configuration property '%s' references unset environment variable '%s'", propertyKey, envName));
+                return;
+            }
+            replaced.put(propertyKey, envValue);
+        });
+        return replaced;
     }
 }
