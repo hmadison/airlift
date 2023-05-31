@@ -46,6 +46,42 @@ public class TestBootstrap
             assertContains(e.getErrorMessages().iterator().next().getMessage(), "Explicit bindings are required");
         }
     }
+    
+    @Test
+    public void testEnvironmentVariableReplacement()
+    {
+        Map<String, String> original = ImmutableMap.<String, String>builder()
+                .put("apple", "apple-value")
+                .put("grape", "${ENV:GRAPE}")
+                .put("peach", "${ENV:PEACH}")
+                .put("grass", "${ENV:!!!}")
+                .put("pear", "${ENV:X_PEAR}")
+                .put("cherry", "${ENV:X_CHERRY}")
+                .put("orange", "orange-value")
+                .build();
+    
+        Map<String, String> environment = ImmutableMap.<String, String>builder()
+                .put("GRAPE", "env-grape")
+                .put("X_CHERRY", "env-cherry")
+                .build();
+    
+        List<String> errors = new ArrayList<>();
+        Map<String, String> actual = replaceEnvironmentVariables(original, environment, (key, error) -> errors.add(error));
+    
+        Map<String, String> expected = ImmutableMap.<String, String>builder()
+                .put("apple", "apple-value")
+                .put("grape", "env-grape")
+                .put("grass", "${ENV:!!!}")
+                .put("cherry", "env-cherry")
+                .put("orange", "orange-value")
+                .build();
+    
+        assertEquals(actual, expected);
+    
+        assertThat(errors).containsExactly(
+                "Configuration property 'peach' references unset environment variable 'PEACH'",
+                "Configuration property 'pear' references unset environment variable 'X_PEAR'");
+    }
 
     @Test
     public void testDoesNotAllowCircularDependencies()
